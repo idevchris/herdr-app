@@ -68,6 +68,7 @@ pub(crate) struct DirectXRenderer {
     atlas_removals: u64,
     last_background: Option<WindowBackgroundAppearance>,
     stats: DamageStats,
+    touched: Touched,
 }
 
 /// HERDR: how a frame keeps the pixels it doesn't redraw.
@@ -111,6 +112,8 @@ struct DamageStats {
     drawn_pixels: f64,
     window_pixels: f64,
     primitives: u64,
+    /// Paths drawn, to see whether the full-size MSAA resolve matters.
+    paths: u64,
     damage_time: std::time::Duration,
     /// Frames forced whole by a freed atlas tile or a new background.
     forced: u64,
@@ -156,7 +159,7 @@ impl DamageStats {
         }
         let line = format!(
             "{mode:?} {}x{}: {} frames in {:.1}s: {} skipped, {} full ({} forced), {} partial; \
-             drew {:.1}% of the pixels; {} primitives/frame; diff {:.2} ms/frame\n",
+             drew {:.1}% of the pixels; {} primitives/frame, {} paths/frame; diff {:.2} ms/frame\n",
             window.x1,
             window.y1,
             self.frames,
@@ -167,6 +170,7 @@ impl DamageStats {
             self.partial,
             100.0 * self.drawn_pixels / self.window_pixels.max(1.0),
             self.primitives / self.frames.max(1),
+            self.paths / self.frames.max(1),
             self.damage_time.as_secs_f64() * 1000.0 / self.frames.max(1) as f64,
         );
         let path = self.path.take();
@@ -347,6 +351,7 @@ impl DirectXRenderer {
             atlas_removals: 0,
             last_background: None,
             stats: DamageStats::from_env(),
+            touched: Touched::default(),
         })
     }
 
@@ -548,7 +553,8 @@ impl DirectXRenderer {
             self.stats.forced += 1;
         }
         let mut frame = self.damage.take_frame();
-        collect_frame(scene, &mut frame);
+        collect_frame(scene, &mut frame, &mut self.touched);
+        self.stats.paths += scene.paths.len() as u64;
         let primitives = frame.len();
         let (changed, draw) = self.damage.next(frame, window);
         let draw = match (self.redraw, &changed) {
@@ -644,27 +650,47 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        // HERDR: in a scissor pass, only the primitives meeting the scissor.
+        let clip = self.scissor;
+        let pick = |touched: &[damage::Rect], range: std::ops::Range<usize>| match &clip {
+            Some(clip) => damage::runs(touched, range, clip),
+            None => vec![range],
+        };
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => self.draw_quads(&scene.quads[range.clone()], range.start),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
-                }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+                PrimitiveBatch::Shadows(range) => pick(&self.touched.shadows, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_shadows(r.start, r.len())),
+                PrimitiveBatch::Quads(range) => pick(&self.touched.quads, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_quads(&scene.quads[r.clone()], r.start)),
+                PrimitiveBatch::Paths(range) => pick(&self.touched.paths, range)
+                    .into_iter()
+                    .try_for_each(|r| {
+                        let paths = &scene.paths[r];
+                        self.draw_paths_to_intermediate(paths)?;
+                        self.draw_paths_from_intermediate(paths)
+                    }),
+                PrimitiveBatch::Underlines(range) => pick(&self.touched.underlines, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_underlines(r.start, r.len())),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
+                    pick(&self.touched.monochrome_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| self.draw_monochrome_sprites(texture_id, r.start, r.len()))
                 }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
+                    pick(&self.touched.subpixel_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| self.draw_subpixel_sprites(texture_id, r.start, r.len()))
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                    pick(&self.touched.polychrome_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| self.draw_polychrome_sprites(texture_id, r.start, r.len()))
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
@@ -2180,43 +2206,64 @@ fn sprite_touched(
         .intersect(&cover(&mask.bounds, 0.0))
 }
 
+/// HERDR: the pixels each primitive of the last collected scene can touch,
+/// by kind and index, so a scissor pass draws only what meets its rectangle.
+#[derive(Default)]
+struct Touched {
+    shadows: Vec<damage::Rect>,
+    quads: Vec<damage::Rect>,
+    paths: Vec<damage::Rect>,
+    underlines: Vec<damage::Rect>,
+    monochrome_sprites: Vec<damage::Rect>,
+    subpixel_sprites: Vec<damage::Rect>,
+    polychrome_sprites: Vec<damage::Rect>,
+}
+
 /// Every primitive of `scene` with the pixels it can touch.
-fn collect_frame(scene: &Scene, frame: &mut damage::Frame) {
+fn collect_frame(scene: &Scene, frame: &mut damage::Frame, touched_by: &mut Touched) {
+    let t = touched_by;
+    for list in [
+        &mut t.shadows,
+        &mut t.quads,
+        &mut t.paths,
+        &mut t.underlines,
+        &mut t.monochrome_sprites,
+        &mut t.subpixel_sprites,
+        &mut t.polychrome_sprites,
+    ] {
+        list.clear();
+    }
     for quad in &scene.quads {
-        frame.add(
-            damage::hash_bytes(1, bytes_of(quad)),
-            touched(&quad.bounds, 0.0, &quad.content_mask),
-        );
+        let rect = touched(&quad.bounds, 0.0, &quad.content_mask);
+        frame.add(damage::hash_bytes(1, bytes_of(quad)), rect);
+        t.quads.push(rect);
     }
     for shadow in &scene.shadows {
         // The shader draws a blurred shadow 3 blur radii past its bounds.
         let rect = touched(&shadow.bounds, 3.0 * shadow.blur_radius.0, &shadow.content_mask)
             .union(&touched(&shadow.element_bounds, 0.0, &shadow.content_mask));
         frame.add(damage::hash_bytes(2, bytes_of(shadow)), rect);
+        t.shadows.push(rect);
     }
     for underline in &scene.underlines {
-        frame.add(
-            damage::hash_bytes(3, bytes_of(underline)),
-            touched(&underline.bounds, underline.thickness.0, &underline.content_mask),
-        );
+        let rect = touched(&underline.bounds, underline.thickness.0, &underline.content_mask);
+        frame.add(damage::hash_bytes(3, bytes_of(underline)), rect);
+        t.underlines.push(rect);
     }
     for sprite in &scene.monochrome_sprites {
-        frame.add(
-            damage::hash_bytes(4, bytes_of(sprite)),
-            sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask),
-        );
+        let rect = sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask);
+        frame.add(damage::hash_bytes(4, bytes_of(sprite)), rect);
+        t.monochrome_sprites.push(rect);
     }
     for sprite in &scene.subpixel_sprites {
-        frame.add(
-            damage::hash_bytes(5, bytes_of(sprite)),
-            sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask),
-        );
+        let rect = sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask);
+        frame.add(damage::hash_bytes(5, bytes_of(sprite)), rect);
+        t.subpixel_sprites.push(rect);
     }
     for sprite in &scene.polychrome_sprites {
-        frame.add(
-            damage::hash_bytes(6, bytes_of(sprite)),
-            touched(&sprite.bounds, 0.0, &sprite.content_mask),
-        );
+        let rect = touched(&sprite.bounds, 0.0, &sprite.content_mask);
+        frame.add(damage::hash_bytes(6, bytes_of(sprite)), rect);
+        t.polychrome_sprites.push(rect);
     }
     for path in &scene.paths {
         // SAFETY: `PathVertex<ScaledPixels>` is `repr(C)` f32s, no padding.
@@ -2231,7 +2278,9 @@ fn collect_frame(scene: &Scene, frame: &mut damage::Frame) {
         hash = damage::hash_bytes(hash, bytes_of(&path.bounds));
         hash = damage::hash_bytes(hash, bytes_of(&path.content_mask));
         hash = damage::hash_bytes(hash, bytes_of(&path.order));
-        frame.add(hash, touched(&path.bounds, 0.0, &path.content_mask));
+        let rect = touched(&path.bounds, 0.0, &path.content_mask);
+        frame.add(hash, rect);
+        t.paths.push(rect);
     }
     // Surfaces are not drawn on Windows.
 }

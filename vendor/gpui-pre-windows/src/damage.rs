@@ -82,7 +82,10 @@ pub(crate) enum Damage {
 }
 
 /// One scissor pass per rectangle: Direct3D 11 has one scissor per viewport.
-pub(crate) const MAX_RECTS: usize = 4;
+/// Each pass draws only the primitives inside its rectangle (see [`runs`]),
+/// so more passes cost little; fewer would merge far-apart spinners into
+/// big boxes.
+pub(crate) const MAX_RECTS: usize = 16;
 /// Above this many raw rectangles, merging pairwise costs more than it saves.
 const MAX_RAW_RECTS: usize = 64;
 /// Damage covering more than this share of the window redraws all of it.
@@ -189,6 +192,28 @@ pub(crate) fn settle(rects: Vec<Rect>, window: Rect) -> Damage {
     } else {
         Damage::Rects(rects)
     }
+}
+
+/// The runs of `range` whose rectangle in `touched` meets `clip`, in order:
+/// what a scissor pass over `clip` must draw. Primitives outside cannot change
+/// a pixel inside, so skipping them keeps the draw order of the rest.
+pub(crate) fn runs(
+    touched: &[Rect],
+    range: std::ops::Range<usize>,
+    clip: &Rect,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for i in range {
+        // Unknown (missing) rectangles are drawn, to be safe.
+        if touched.get(i).is_some_and(|r| r.intersect(clip).is_empty()) {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.end == i => last.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
 }
 
 /// Rectangles that together cover `a` and `b` (for the buffer-age mode).
@@ -326,9 +351,14 @@ mod tests {
 
     #[test]
     fn far_apart_changes_stay_separate_up_to_the_limit() {
-        let rects: Vec<Rect> = (0..6)
-            .map(|i| Rect::new(i * 150, i * 100, i * 150 + 24, i * 100 + 24))
+        // Spinners far apart: kept apart while there are few, merged beyond.
+        let rects: Vec<Rect> = (0..MAX_RECTS as i32 + 4)
+            .map(|i| Rect::new(i * 45, i * 38, i * 45 + 24, i * 38 + 24))
             .collect();
+        let Damage::Rects(out) = settle(rects[..6].to_vec(), WINDOW) else {
+            panic!("expected rects");
+        };
+        assert_eq!(out.len(), 6);
         let Damage::Rects(out) = settle(rects.clone(), WINDOW) else {
             panic!("expected rects");
         };
@@ -336,6 +366,23 @@ mod tests {
         for r in &rects {
             assert!(out.iter().any(|o| o.intersect(r) == *r), "{r:?} not covered");
         }
+    }
+
+    #[test]
+    fn runs_keep_only_primitives_meeting_the_clip_in_order() {
+        let touched = [
+            Rect::new(0, 0, 10, 10),
+            Rect::new(5, 5, 15, 15),
+            Rect::new(100, 100, 110, 110),
+            Rect::new(0, 0, 50, 50),
+            Rect::new(200, 0, 210, 10),
+        ];
+        let clip = Rect::new(8, 8, 20, 20);
+        assert_eq!(runs(&touched, 0..5, &clip), vec![0..2, 3..4]);
+        assert_eq!(runs(&touched, 1..3, &clip), vec![1..2]);
+        assert!(runs(&touched, 2..3, &clip).is_empty());
+        // Past the known rectangles: drawn.
+        assert_eq!(runs(&touched, 4..7, &clip), vec![5..7]);
     }
 
     #[test]
