@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -54,6 +54,133 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    // HERDR: redraw only what changed (see `damage.rs`).
+    redraw: RedrawMode,
+    damage: damage::Tracker,
+    /// The texture the frame is drawn into in `RedrawMode::Canvas`; it keeps
+    /// the last frame, the swap chain's buffers don't.
+    canvas: Option<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)>,
+    /// What the current frame draws into: the canvas or the back buffer.
+    target_view: Option<ID3D11RenderTargetView>,
+    /// The scissor of the current pass; `None` when drawing everything.
+    scissor: Option<damage::Rect>,
+    atlas_removals: u64,
+    last_background: Option<WindowBackgroundAppearance>,
+    stats: DamageStats,
+}
+
+/// HERDR: how a frame keeps the pixels it doesn't redraw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedrawMode {
+    /// Redraw the whole window every frame (`HERDR_APP_FULL_REDRAW=1`), as
+    /// before.
+    Full,
+    /// Draw the changed rectangles into a texture that keeps the last frame,
+    /// then copy it to the back buffer (`HERDR_APP_DAMAGE=canvas`, default).
+    Canvas,
+    /// Draw straight into the back buffer, redrawing what changed since that
+    /// buffer was last shown (`HERDR_APP_DAMAGE=age`). Flip-sequential swap
+    /// chains keep each buffer's pixels.
+    Age,
+}
+
+impl RedrawMode {
+    fn from_env() -> Self {
+        if std::env::var("HERDR_APP_FULL_REDRAW").is_ok_and(|v| v == "1") {
+            return Self::Full;
+        }
+        match std::env::var("HERDR_APP_DAMAGE").as_deref() {
+            Ok("age") => Self::Age,
+            Ok("full") => Self::Full,
+            _ => Self::Canvas,
+        }
+    }
+}
+
+/// HERDR: what was drawn, appended every 5 seconds to the file named by
+/// `HERDR_APP_DAMAGE_LOG` (a GUI app on Windows has no console to log to).
+#[derive(Default)]
+struct DamageStats {
+    path: Option<std::path::PathBuf>,
+    since: Option<std::time::Instant>,
+    frames: u64,
+    skipped: u64,
+    full: u64,
+    partial: u64,
+    drawn_pixels: f64,
+    window_pixels: f64,
+    primitives: u64,
+    damage_time: std::time::Duration,
+}
+
+impl DamageStats {
+    fn from_env() -> Self {
+        Self {
+            path: std::env::var_os("HERDR_APP_DAMAGE_LOG").map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    fn record(
+        &mut self,
+        mode: RedrawMode,
+        drawn: &damage::Damage,
+        window: damage::Rect,
+        primitives: usize,
+        took: std::time::Duration,
+    ) {
+        if self.path.is_none() {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.frames += 1;
+        self.primitives += primitives as u64;
+        self.damage_time += took;
+        self.window_pixels += window.area() as f64;
+        match drawn {
+            damage::Damage::None => self.skipped += 1,
+            damage::Damage::Full => {
+                self.full += 1;
+                self.drawn_pixels += window.area() as f64;
+            }
+            damage::Damage::Rects(rects) => {
+                self.partial += 1;
+                self.drawn_pixels += rects.iter().map(damage::Rect::area).sum::<i64>() as f64;
+            }
+        }
+        if since.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        let line = format!(
+            "{mode:?} {}x{}: {} frames in {:.1}s: {} skipped, {} full, {} partial; \
+             drew {:.1}% of the pixels; {} primitives/frame; diff {:.2} ms/frame\n",
+            window.x1,
+            window.y1,
+            self.frames,
+            since.elapsed().as_secs_f64(),
+            self.skipped,
+            self.full,
+            self.partial,
+            100.0 * self.drawn_pixels / self.window_pixels.max(1.0),
+            self.primitives / self.frames.max(1),
+            self.damage_time.as_secs_f64() * 1000.0 / self.frames.max(1) as f64,
+        );
+        let path = self.path.take();
+        if let Some(path) = &path {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+                .log_err();
+        }
+        *self = Self {
+            path,
+            ..Default::default()
+        };
+    }
 }
 
 /// Direct3D objects
@@ -65,6 +192,8 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) device_context: ID3D11DeviceContext,
     dxgi_device: Option<IDXGIDevice>,
     annotation: Option<ID3DUserDefinedAnnotation>,
+    // HERDR: for `ClearView`, which clears rectangles only.
+    context1: Option<ID3D11DeviceContext1>,
 }
 
 struct DirectXResources {
@@ -141,6 +270,7 @@ impl DirectXRendererDevices {
             Some(device.cast().context("Creating DXGI device")?)
         };
         let annotation = device_context.cast().ok();
+        let context1 = device_context.cast().ok();
 
         Ok(Self {
             adapter: adapter.clone(),
@@ -149,6 +279,7 @@ impl DirectXRendererDevices {
             device_context: device_context.clone(),
             dxgi_device,
             annotation,
+            context1,
         })
     }
 }
@@ -165,6 +296,11 @@ impl DirectXRenderer {
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Creating DirectX devices")?;
+        let mut redraw = RedrawMode::from_env();
+        if devices.context1.is_none() {
+            redraw = RedrawMode::Full;
+        }
+        log::info!("redraw mode: {redraw:?}");
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
         let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
@@ -197,6 +333,17 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            redraw,
+            damage: damage::Tracker::new(match redraw {
+                RedrawMode::Age => BUFFER_COUNT - 1,
+                _ => 0,
+            }),
+            canvas: None,
+            target_view: None,
+            scissor: None,
+            atlas_removals: 0,
+            last_background: None,
+            stats: DamageStats::from_env(),
         })
     }
 
@@ -204,13 +351,10 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(&self, clear_color: &[f32; 4], rects: Option<&[damage::Rect]>) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
-        let device_context = &self
-            .devices
-            .as_ref()
-            .expect("devices missing")
-            .device_context;
+        let devices = self.devices.as_ref().expect("devices missing");
+        let device_context = &devices.device_context;
         update_buffer(
             device_context,
             self.globals.global_params_buffer.as_ref().unwrap(),
@@ -223,16 +367,20 @@ impl DirectXRenderer {
                 _pad: [0; 3],
             }],
         )?;
+        let target = self
+            .target_view
+            .as_ref()
+            .context("missing render target view")?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
-            device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            match (rects, &devices.context1) {
+                // HERDR: clear only what is redrawn; the rest keeps the last frame.
+                (Some(rects), Some(context1)) => {
+                    let rects: Vec<RECT> = rects.iter().map(to_rect).collect();
+                    context1.ClearView(target, clear_color, Some(&rects));
+                }
+                _ => device_context.ClearRenderTargetView(target, clear_color),
+            }
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&self.target_view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
@@ -244,14 +392,22 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// HERDR: presents, telling DWM which rectangles changed.
     #[inline]
-    fn present(&mut self) -> Result<()> {
-        let result = unsafe {
-            self.resources
-                .as_ref()
-                .expect("resources missing")
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+    fn present(&mut self, changed: &damage::Damage) -> Result<()> {
+        let swap_chain = &self.resources.as_ref().expect("resources missing").swap_chain;
+        let result = match changed {
+            damage::Damage::Rects(rects) => {
+                let mut rects: Vec<RECT> = rects.iter().map(to_rect).collect();
+                let params = DXGI_PRESENT_PARAMETERS {
+                    DirtyRectsCount: rects.len() as u32,
+                    pDirtyRects: rects.as_mut_ptr(),
+                    pScrollRect: std::ptr::null_mut(),
+                    pScrollOffset: std::ptr::null_mut(),
+                };
+                unsafe { swap_chain.Present1(0, DXGI_PRESENT(0), &params) }
+            }
+            _ => unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) },
         };
         result.ok().context("Presenting swap chain failed")
     }
@@ -265,6 +421,7 @@ impl DirectXRenderer {
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
+        self.forget_frames();
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -330,6 +487,13 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// HERDR: drop what the next frame would build on (canvas, last frames).
+    fn forget_frames(&mut self) {
+        self.canvas = None;
+        self.target_view = None;
+        self.damage.invalidate();
+    }
+
     pub(crate) fn draw(
         &mut self,
         scene: &Scene,
@@ -340,8 +504,84 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        let window = damage::Rect::new(0, 0, self.width as i32, self.height as i32);
+        if self.redraw == RedrawMode::Full {
+            let target = self.back_buffer_view()?;
+            self.render(scene, background_appearance, target, None)?;
+            self.stats.record(
+                self.redraw,
+                &damage::Damage::Full,
+                window,
+                0,
+                std::time::Duration::ZERO,
+            );
+            return self.present(&damage::Damage::Full);
+        }
+        let result = self.draw_damage(scene, background_appearance, window);
+        if result.is_err() {
+            self.forget_frames();
+        }
+        result
+    }
+
+    /// HERDR: draws only what changed since the last frame.
+    fn draw_damage(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+        window: damage::Rect,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        if self.redraw == RedrawMode::Canvas && self.canvas.is_none() {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            self.canvas = Some(create_canvas(&devices.device, self.width, self.height)?);
+            self.damage.invalidate();
+        }
+        let removals = self.atlas.removals();
+        if removals != self.atlas_removals || self.last_background != Some(background_appearance) {
+            self.atlas_removals = removals;
+            self.last_background = Some(background_appearance);
+            self.damage.invalidate();
+        }
+        let mut frame = self.damage.take_frame();
+        collect_frame(scene, &mut frame);
+        let primitives = frame.len();
+        let (changed, draw) = self.damage.next(frame, window);
+        let draw = match (self.redraw, &changed) {
+            (_, damage::Damage::None) => damage::Damage::None,
+            (RedrawMode::Age, _) => draw,
+            _ => changed.clone(),
+        };
+        self.stats
+            .record(self.redraw, &draw, window, primitives, started.elapsed());
+        let rects = match &draw {
+            damage::Damage::None => return Ok(()),
+            damage::Damage::Full => None,
+            damage::Damage::Rects(rects) => Some(rects.as_slice()),
+        };
+
+        let target = match &self.canvas {
+            Some((_, view)) => view.clone(),
+            None => self.back_buffer_view()?,
+        };
+        self.render(scene, background_appearance, target, rects)?;
+        if let Some((canvas, _)) = &self.canvas {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            let back_buffer = resources
+                .render_target
+                .as_ref()
+                .context("render target missing")?;
+            unsafe { devices.device_context.CopyResource(back_buffer, canvas) };
+        }
+        self.present(&changed)?;
+        self.damage.presented(changed);
+        Ok(())
+    }
+
+    fn back_buffer_view(&self) -> Result<Option<ID3D11RenderTargetView>> {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        Ok(resources.render_target_view.clone())
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -349,17 +589,52 @@ impl DirectXRenderer {
     /// [`draw`](Self::draw) (which then presents) and
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
+    ///
+    /// HERDR: draws into `target`, and with `rects` only inside them (one
+    /// scissor pass each).
     fn render(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
+        target: Option<ID3D11RenderTargetView>,
+        rects: Option<&[damage::Rect]>,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+        self.target_view = target;
+        self.pre_draw(
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+            rects,
+        )?;
         self.upload_scene_buffers(scene)?;
+        let result = match rects {
+            None => self
+                .set_scissor(None)
+                .and_then(|()| self.draw_batches(scene)),
+            Some(rects) => rects.iter().try_for_each(|rect| {
+                self.set_scissor(Some(*rect))?;
+                self.draw_batches(scene)
+            }),
+        };
+        self.scissor = None;
+        result
+    }
 
+    /// HERDR: limits drawing to `rect`, or to the whole window.
+    fn set_scissor(&mut self, rect: Option<damage::Rect>) -> Result<()> {
+        self.scissor = rect;
+        let rect = rect.unwrap_or(damage::Rect::new(0, 0, self.width as i32, self.height as i32));
+        let devices = self.devices.as_ref().context("devices missing")?;
+        unsafe {
+            devices
+                .device_context
+                .RSSetScissorRects(Some(&[to_rect(&rect)]))
+        };
+        Ok(())
+    }
+
+    fn draw_batches(&mut self, scene: &Scene) -> Result<()> {
         let annotation = self
             .devices
             .as_ref()
@@ -425,7 +700,10 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
-        self.render(scene, background_appearance)?;
+        let target = self.back_buffer_view()?;
+        self.render(scene, background_appearance, target, None)?;
+        // HERDR: the back buffer no longer holds what was presented.
+        self.forget_frames();
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
@@ -493,6 +771,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.forget_frames();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -624,10 +903,16 @@ impl DirectXRenderer {
         let resources = self.resources.as_ref().context("resources missing")?;
         // Clear intermediate MSAA texture
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            let msaa_view = resources.path_intermediate_msaa_view.as_ref().unwrap();
+            match (self.scissor, &devices.context1) {
+                // HERDR: only the scissor's pixels are drawn and copied back.
+                (Some(rect), Some(context1)) => {
+                    context1.ClearView(msaa_view, &[0.0; 4], Some(&[to_rect(&rect)]))
+                }
+                _ => devices
+                    .device_context
+                    .ClearRenderTargetView(msaa_view, &[0.0; 4]),
+            }
             // Set intermediate MSAA texture as render target
             devices.device_context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
@@ -672,7 +957,7 @@ impl DirectXRenderer {
             // Restore main render target
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(&self.target_view)), None);
         }
 
         Ok(())
@@ -1509,7 +1794,8 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        // HERDR: `set_scissor` limits each pass to the damaged rectangle.
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -1788,6 +2074,142 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
 }
 
 const BUFFER_COUNT: usize = 3;
+
+// HERDR: damage tracking helpers.
+
+fn to_rect(rect: &damage::Rect) -> RECT {
+    RECT {
+        left: rect.x0,
+        top: rect.y0,
+        right: rect.x1,
+        bottom: rect.y1,
+    }
+}
+
+/// A texture that keeps the last frame for `RedrawMode::Canvas`.
+fn create_canvas(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: RENDER_TARGET_FORMAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    let texture = texture.context("creating canvas texture")?;
+    let mut view = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut view))? };
+    Ok((texture, view))
+}
+
+/// The bytes of a GPU-facing primitive: `repr(C)` without padding, uploaded
+/// to the GPU the same way.
+fn bytes_of<T: Copy>(value: &T) -> &[u8] {
+    // SAFETY: `T` is a plain `repr(C)` primitive without padding bytes.
+    unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn cover(bounds: &Bounds<ScaledPixels>, grow: f32) -> damage::Rect {
+    damage::Rect::cover(
+        bounds.origin.x.0 - grow,
+        bounds.origin.y.0 - grow,
+        bounds.size.width.0 + 2.0 * grow,
+        bounds.size.height.0 + 2.0 * grow,
+        1,
+    )
+}
+
+/// The pixels `bounds` (grown by `grow`) can touch inside `mask`.
+fn touched(
+    bounds: &Bounds<ScaledPixels>,
+    grow: f32,
+    mask: &ContentMask<ScaledPixels>,
+) -> damage::Rect {
+    cover(bounds, grow).intersect(&cover(&mask.bounds, 0.0))
+}
+
+/// A sprite's pixels; a rotated or scaled one may leave its bounds, so it
+/// counts as touching its whole mask.
+fn sprite_touched(
+    bounds: &Bounds<ScaledPixels>,
+    transformation: &TransformationMatrix,
+    mask: &ContentMask<ScaledPixels>,
+) -> damage::Rect {
+    if *transformation == TransformationMatrix::unit() {
+        touched(bounds, 0.0, mask)
+    } else {
+        cover(&mask.bounds, 0.0)
+    }
+}
+
+/// Every primitive of `scene` with the pixels it can touch.
+fn collect_frame(scene: &Scene, frame: &mut damage::Frame) {
+    for quad in &scene.quads {
+        frame.add(
+            damage::hash_bytes(1, bytes_of(quad)),
+            touched(&quad.bounds, 0.0, &quad.content_mask),
+        );
+    }
+    for shadow in &scene.shadows {
+        // The shader draws a blurred shadow 3 blur radii past its bounds.
+        let rect = touched(&shadow.bounds, 3.0 * shadow.blur_radius.0, &shadow.content_mask)
+            .union(&touched(&shadow.element_bounds, 0.0, &shadow.content_mask));
+        frame.add(damage::hash_bytes(2, bytes_of(shadow)), rect);
+    }
+    for underline in &scene.underlines {
+        frame.add(
+            damage::hash_bytes(3, bytes_of(underline)),
+            touched(&underline.bounds, underline.thickness.0, &underline.content_mask),
+        );
+    }
+    for sprite in &scene.monochrome_sprites {
+        frame.add(
+            damage::hash_bytes(4, bytes_of(sprite)),
+            sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask),
+        );
+    }
+    for sprite in &scene.subpixel_sprites {
+        frame.add(
+            damage::hash_bytes(5, bytes_of(sprite)),
+            sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask),
+        );
+    }
+    for sprite in &scene.polychrome_sprites {
+        frame.add(
+            damage::hash_bytes(6, bytes_of(sprite)),
+            touched(&sprite.bounds, 0.0, &sprite.content_mask),
+        );
+    }
+    for path in &scene.paths {
+        // SAFETY: `PathVertex<ScaledPixels>` is `repr(C)` f32s, no padding.
+        let vertices = unsafe {
+            slice::from_raw_parts(
+                path.vertices.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(path.vertices.as_slice()),
+            )
+        };
+        let mut hash = damage::hash_bytes(7, vertices);
+        hash = damage::hash_bytes(hash, bytes_of(&path.color));
+        hash = damage::hash_bytes(hash, bytes_of(&path.bounds));
+        hash = damage::hash_bytes(hash, bytes_of(&path.content_mask));
+        hash = damage::hash_bytes(hash, bytes_of(&path.order));
+        frame.add(hash, touched(&path.bounds, 0.0, &path.content_mask));
+    }
+    // Surfaces are not drawn on Windows.
+}
 
 pub(crate) mod shader_resources {
     use anyhow::Result;
