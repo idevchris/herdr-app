@@ -58,6 +58,9 @@ pub(crate) struct DirectXRenderer {
     // HERDR: redraw only what changed (see `damage.rs`).
     redraw: RedrawMode,
     damage: damage::Tracker,
+    /// Canvas: copy the whole canvas to the back buffer every frame
+    /// (`HERDR_APP_DAMAGE_COPY=full`), instead of only what it lacks.
+    copy_all: bool,
     /// The texture the frame is drawn into in `RedrawMode::Canvas`; it keeps
     /// the last frame, the swap chain's buffers don't.
     canvas: Option<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)>,
@@ -117,6 +120,8 @@ struct DamageStats {
     damage_time: std::time::Duration,
     /// Frames forced whole by a freed atlas tile or a new background.
     forced: u64,
+    /// The rectangles of the last partial frame, to see what keeps changing.
+    last_rects: Vec<damage::Rect>,
 }
 
 impl DamageStats {
@@ -152,6 +157,7 @@ impl DamageStats {
             damage::Damage::Rects(rects) => {
                 self.partial += 1;
                 self.drawn_pixels += rects.iter().map(damage::Rect::area).sum::<i64>() as f64;
+                self.last_rects.clone_from(rects);
             }
         }
         if since.elapsed() < std::time::Duration::from_secs(5) {
@@ -159,7 +165,8 @@ impl DamageStats {
         }
         let line = format!(
             "{mode:?} {}x{}: {} frames in {:.1}s: {} skipped, {} full ({} forced), {} partial; \
-             drew {:.1}% of the pixels; {} primitives/frame, {} paths/frame; diff {:.2} ms/frame\n",
+             drew {:.1}% of the pixels; {} primitives/frame, {} paths/frame; diff {:.2} ms/frame; \
+             last {}\n",
             window.x1,
             window.y1,
             self.frames,
@@ -172,6 +179,11 @@ impl DamageStats {
             self.primitives / self.frames.max(1),
             self.paths / self.frames.max(1),
             self.damage_time.as_secs_f64() * 1000.0 / self.frames.max(1) as f64,
+            self.last_rects
+                .iter()
+                .map(|r| format!("{},{} {}x{}", r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         let path = self.path.take();
         if let Some(path) = &path {
@@ -341,10 +353,10 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
             redraw,
-            damage: damage::Tracker::new(match redraw {
-                RedrawMode::Age => BUFFER_COUNT - 1,
-                _ => 0,
-            }),
+            // Canvas copies, and age draws, what changed since a back buffer
+            // was last shown: up to `BUFFER_COUNT - 1` frames ago.
+            damage: damage::Tracker::new(BUFFER_COUNT - 1),
+            copy_all: std::env::var("HERDR_APP_DAMAGE_COPY").is_ok_and(|v| v == "full"),
             canvas: None,
             target_view: None,
             scissor: None,
@@ -556,10 +568,11 @@ impl DirectXRenderer {
         collect_frame(scene, &mut frame, &mut self.touched);
         self.stats.paths += scene.paths.len() as u64;
         let primitives = frame.len();
-        let (changed, draw) = self.damage.next(frame, window);
+        // `stale`: what changed since the back buffer we get now was shown.
+        let (changed, stale) = self.damage.next(frame, window);
         let draw = match (self.redraw, &changed) {
             (_, damage::Damage::None) => damage::Damage::None,
-            (RedrawMode::Age, _) => draw,
+            (RedrawMode::Age, _) => stale.clone(),
             _ => changed.clone(),
         };
         self.stats
@@ -582,7 +595,35 @@ impl DirectXRenderer {
                 .render_target
                 .as_ref()
                 .context("render target missing")?;
-            unsafe { devices.device_context.CopyResource(back_buffer, canvas) };
+            // HERDR: flip-sequential buffers keep their pixels, so the back
+            // buffer only lacks what changed since it was last shown.
+            match (&stale, self.copy_all) {
+                (damage::Damage::Rects(rects), false) => {
+                    for rect in rects {
+                        let region = D3D11_BOX {
+                            left: rect.x0 as u32,
+                            top: rect.y0 as u32,
+                            front: 0,
+                            right: rect.x1 as u32,
+                            bottom: rect.y1 as u32,
+                            back: 1,
+                        };
+                        unsafe {
+                            devices.device_context.CopySubresourceRegion(
+                                back_buffer,
+                                0,
+                                rect.x0 as u32,
+                                rect.y0 as u32,
+                                0,
+                                canvas,
+                                0,
+                                Some(&region),
+                            )
+                        };
+                    }
+                }
+                _ => unsafe { devices.device_context.CopyResource(back_buffer, canvas) },
+            }
         }
         self.present(&changed)?;
         self.damage.presented(changed);
