@@ -112,6 +112,8 @@ struct DamageStats {
     window_pixels: f64,
     primitives: u64,
     damage_time: std::time::Duration,
+    /// Frames forced whole by a freed atlas tile or a new background.
+    forced: u64,
 }
 
 impl DamageStats {
@@ -153,7 +155,7 @@ impl DamageStats {
             return;
         }
         let line = format!(
-            "{mode:?} {}x{}: {} frames in {:.1}s: {} skipped, {} full, {} partial; \
+            "{mode:?} {}x{}: {} frames in {:.1}s: {} skipped, {} full ({} forced), {} partial; \
              drew {:.1}% of the pixels; {} primitives/frame; diff {:.2} ms/frame\n",
             window.x1,
             window.y1,
@@ -161,6 +163,7 @@ impl DamageStats {
             since.elapsed().as_secs_f64(),
             self.skipped,
             self.full,
+            self.forced,
             self.partial,
             100.0 * self.drawn_pixels / self.window_pixels.max(1.0),
             self.primitives / self.frames.max(1),
@@ -542,6 +545,7 @@ impl DirectXRenderer {
             self.atlas_removals = removals;
             self.last_background = Some(background_appearance);
             self.damage.invalidate();
+            self.stats.forced += 1;
         }
         let mut frame = self.damage.take_frame();
         collect_frame(scene, &mut frame);
@@ -2141,18 +2145,39 @@ fn touched(
     cover(bounds, grow).intersect(&cover(&mask.bounds, 0.0))
 }
 
-/// A sprite's pixels; a rotated or scaled one may leave its bounds, so it
-/// counts as touching its whole mask.
+/// A sprite's pixels. A rotated one (a spinning icon) covers its turned
+/// corners; the shader computes `mul(position, rotation_scale)`, so both
+/// readings of the matrix are covered rather than guessing HLSL's layout.
 fn sprite_touched(
     bounds: &Bounds<ScaledPixels>,
     transformation: &TransformationMatrix,
     mask: &ContentMask<ScaledPixels>,
 ) -> damage::Rect {
     if *transformation == TransformationMatrix::unit() {
-        touched(bounds, 0.0, mask)
-    } else {
-        cover(&mask.bounds, 0.0)
+        return touched(bounds, 0.0, mask);
     }
+    let m = transformation.rotation_scale;
+    let t = transformation.translation;
+    let (x0, y0) = (bounds.origin.x.0, bounds.origin.y.0);
+    let (x1, y1) = (x0 + bounds.size.width.0, y0 + bounds.size.height.0);
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        for (px, py) in [
+            (x * m[0][0] + y * m[1][0], x * m[0][1] + y * m[1][1]),
+            (x * m[0][0] + y * m[0][1], x * m[1][0] + y * m[1][1]),
+        ] {
+            min_x = min_x.min(px + t[0]);
+            min_y = min_y.min(py + t[1]);
+            max_x = max_x.max(px + t[0]);
+            max_y = max_y.max(py + t[1]);
+        }
+    }
+    if ![min_x, min_y, max_x, max_y].iter().all(|v| v.is_finite()) {
+        return cover(&mask.bounds, 0.0);
+    }
+    damage::Rect::cover(min_x, min_y, max_x - min_x, max_y - min_y, 1)
+        .intersect(&cover(&mask.bounds, 0.0))
 }
 
 /// Every primitive of `scene` with the pixels it can touch.
