@@ -1493,8 +1493,9 @@ fn materialize_component(
             if let Some(ms) = behavior.spin {
                 let turn = (loop_clock_ms() % ms) / ms;
                 image = image.with_transformation(gpui::Transformation::rotate(gpui::radians((turn * std::f64::consts::TAU) as f32)));
-                // ~10 fps: a small spinner looks the same, and each step redraws its whole view.
-                wake_view_after(Duration::from_millis(100), window, cx);
+                // ~10 fps (fewer without a GPU): a small spinner looks the same,
+                // and each step redraws its whole view.
+                wake_view_after(spin_step(window), window, cx);
             }
             image.into_any_element()
         }
@@ -2897,6 +2898,31 @@ struct Loop {
     easing: String,
 }
 
+/// HERDR: how often a spinner steps: 10 times a second, 4 without a GPU.
+/// There every step is rasterized on the CPU (Direct3D's WARP, llvmpipe),
+/// and a small spinner turning 4 times a second still reads as working.
+/// `HERDR_APP_SPIN_MS` sets it (for measuring).
+fn spin_step(window: &Window) -> Duration {
+    thread_local! {
+        static STEP: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+    STEP.with(|step| {
+        if let Some(step) = step.get() {
+            return step;
+        }
+        let ms = std::env::var("HERDR_APP_SPIN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                let software = window.gpu_specs().is_some_and(|gpu| gpu.is_software_emulated);
+                if software { 250 } else { 100 }
+            });
+        let ms = Duration::from_millis(ms.max(16));
+        step.set(Some(ms));
+        ms
+    })
+}
+
 /// One clock for every view, so spinners in different mods turn together.
 fn loop_clock_ms() -> f64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -3038,7 +3064,7 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
                     let _ = window.paint_svg(s.bounds, s.path, None, matrix, s.color, cx);
                 });
             }
-            wake_view_after(Duration::from_millis(100), window, cx);
+            wake_view_after(spin_step(window), window, cx);
         },
     )
     .absolute()
