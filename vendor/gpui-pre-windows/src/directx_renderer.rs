@@ -273,6 +273,10 @@ impl DirectXRenderer {
             }
             None => unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) },
         };
+        // HERDR: whether an occluded window's buffers advanced is unknown.
+        if result == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+            self.forget_frames();
+        }
         result.ok().context("Presenting swap chain failed")
     }
 
