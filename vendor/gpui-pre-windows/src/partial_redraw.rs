@@ -62,6 +62,66 @@ pub(crate) struct PartialRedraw {
     background: Option<WindowBackgroundAppearance>,
     /// The pixels each primitive of the last scene can touch.
     pub touched: Touched,
+    diag: Diag,
+}
+
+/// MESSUNG: damage with and without the draw order in the hash, appended
+/// every 5 s to `HERDR_APP_DAMAGE_LOG`.
+#[derive(Default)]
+struct Diag {
+    previous: Option<damage::Frame>,
+    since: Option<std::time::Instant>,
+    frames: u64,
+    full: [u64; 2],
+    pixels: [f64; 2],
+    window: f64,
+}
+
+impl Diag {
+    fn record(&mut self, ordered: &Damage, unordered: Damage, window: Rect) {
+        let Some(path) = std::env::var_os("HERDR_APP_DAMAGE_LOG") else {
+            return;
+        };
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.frames += 1;
+        self.window += window.area() as f64;
+        for (i, d) in [ordered, &unordered].into_iter().enumerate() {
+            match d {
+                Damage::None => {}
+                Damage::Full => {
+                    self.full[i] += 1;
+                    self.pixels[i] += window.area() as f64;
+                }
+                Damage::Rects(rects) => {
+                    self.pixels[i] += rects.iter().map(Rect::area).sum::<i64>() as f64;
+                }
+            }
+        }
+        if since.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        let line = format!(
+            "{}x{}: {} frames; with order {} full, {:.1}% px; without order {} full, {:.1}% px\n",
+            window.x1,
+            window.y1,
+            self.frames,
+            self.full[0],
+            100.0 * self.pixels[0] / self.window.max(1.0),
+            self.full[1],
+            100.0 * self.pixels[1] / self.window.max(1.0),
+        );
+        use std::io::Write as _;
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        let previous = self.previous.take();
+        *self = Self {
+            previous,
+            ..Default::default()
+        };
+    }
 }
 
 impl PartialRedraw {
@@ -75,6 +135,7 @@ impl PartialRedraw {
             atlas_removals: 0,
             background: None,
             touched: Touched::default(),
+            diag: Diag::default(),
         }
     }
 
@@ -116,6 +177,16 @@ impl PartialRedraw {
         collect_frame(scene, &mut frame, &mut self.touched);
         let window = Rect::new(0, 0, width as i32, height as i32);
         let (changed, stale) = self.tracker.next(frame, window);
+        let mut unordered = damage::Frame::default();
+        collect_unordered(scene, &mut unordered);
+        let unordered_damage = match &self.diag.previous {
+            Some(previous) if changed != Damage::Full => {
+                damage::settle(damage::diff(previous, &unordered), window)
+            }
+            _ => changed.clone(),
+        };
+        self.diag.previous = Some(unordered);
+        self.diag.record(&changed, unordered_damage, window);
         if changed == Damage::None {
             return Ok(None);
         }
@@ -266,6 +337,47 @@ fn sprite_touched(
         return cover(&mask.bounds, 0.0);
     }
     Rect::cover(min_x, min_y, max_x - min_x, max_y - min_y, 1).intersect(&cover(&mask.bounds, 0.0))
+}
+
+/// MESSUNG: like `collect_frame`, with every draw order set to 0.
+fn collect_unordered(scene: &Scene, frame: &mut damage::Frame) {
+    let mut t = Touched::default();
+    for quad in &scene.quads {
+        let mut q = *quad;
+        q.order = 0;
+        frame.add(damage::hash_bytes(1, bytes_of(&q)), touched(&quad.bounds, 0.0, &quad.content_mask));
+    }
+    for shadow in &scene.shadows {
+        let mut q = *shadow;
+        q.order = 0;
+        let rect = touched(&shadow.bounds, 3.0 * shadow.blur_radius.0, &shadow.content_mask)
+            .union(&touched(&shadow.element_bounds, 0.0, &shadow.content_mask));
+        frame.add(damage::hash_bytes(2, bytes_of(&q)), rect);
+    }
+    for underline in &scene.underlines {
+        let mut q = *underline;
+        q.order = 0;
+        let rect = touched(&underline.bounds, underline.thickness.0, &underline.content_mask);
+        frame.add(damage::hash_bytes(3, bytes_of(&q)), rect);
+    }
+    for sprite in &scene.monochrome_sprites {
+        let mut q = *sprite;
+        q.order = 0;
+        let rect = sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask);
+        frame.add(damage::hash_bytes(4, bytes_of(&q)), rect);
+    }
+    for sprite in &scene.subpixel_sprites {
+        let mut q = *sprite;
+        q.order = 0;
+        let rect = sprite_touched(&sprite.bounds, &sprite.transformation, &sprite.content_mask);
+        frame.add(damage::hash_bytes(5, bytes_of(&q)), rect);
+    }
+    for sprite in &scene.polychrome_sprites {
+        let mut q = *sprite;
+        q.order = 0;
+        frame.add(damage::hash_bytes(6, bytes_of(&q)), touched(&sprite.bounds, 0.0, &sprite.content_mask));
+    }
+    let _ = &mut t;
 }
 
 /// Every primitive of `scene`, hashed with the pixels it can touch.
