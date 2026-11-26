@@ -2212,9 +2212,7 @@ fn touched(
     cover(bounds, grow).intersect(&cover(&mask.bounds, 0.0))
 }
 
-/// A sprite's pixels. A rotated one (a spinning icon) covers its turned
-/// corners; the shader computes `mul(position, rotation_scale)`, so both
-/// readings of the matrix are covered rather than guessing HLSL's layout.
+/// A sprite's pixels. A rotated one (a spinning icon) covers its turned corners.
 fn sprite_touched(
     bounds: &Bounds<ScaledPixels>,
     transformation: &TransformationMatrix,
@@ -2229,16 +2227,14 @@ fn sprite_touched(
     let (x1, y1) = (x0 + bounds.size.width.0, y0 + bounds.size.height.0);
     let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
     let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    // Rows times the point, as `TransformationMatrix::apply` and the shader do.
     for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-        for (px, py) in [
-            (x * m[0][0] + y * m[1][0], x * m[0][1] + y * m[1][1]),
-            (x * m[0][0] + y * m[0][1], x * m[1][0] + y * m[1][1]),
-        ] {
-            min_x = min_x.min(px + t[0]);
-            min_y = min_y.min(py + t[1]);
-            max_x = max_x.max(px + t[0]);
-            max_y = max_y.max(py + t[1]);
-        }
+        let px = x * m[0][0] + y * m[0][1] + t[0];
+        let py = x * m[1][0] + y * m[1][1] + t[1];
+        min_x = min_x.min(px);
+        min_y = min_y.min(py);
+        max_x = max_x.max(px);
+        max_y = max_y.max(py);
     }
     if ![min_x, min_y, max_x, max_y].iter().all(|v| v.is_finite()) {
         return cover(&mask.bounds, 0.0);
