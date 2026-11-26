@@ -22,7 +22,7 @@ run-name: ${{ github.ref_type == 'tag' && format('release {0}', github.ref_name)
 on:
   push:
     tags: ["v*"]
-    branches: [master, damage-tracking]
+    branches: [master, windows-partial-redraw-messung]
     paths:
       - Cargo.lock
       - Cargo.toml
