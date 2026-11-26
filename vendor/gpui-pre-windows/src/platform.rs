@@ -450,6 +450,9 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                // HERDR: fewer frames without a GPU (see `min_frame_interval`).
+                let mut min_interval = min_frame_interval(&directx_device.adapter);
+                let mut next_frame = std::time::Instant::now();
                 loop {
                     let signal_source = vsync_provider.wait_for_vsync();
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
@@ -468,6 +471,17 @@ impl WindowsPlatform {
                         ) {
                             panic!("Device lost: {err}");
                         }
+                        min_interval = min_frame_interval(&directx_device.adapter);
+                    }
+                    // A skipped vsync leaves the windows' changes for a later one.
+                    if let Some(min) = min_interval {
+                        // Half a 60 Hz frame early is on time: vsyncs rarely
+                        // land exactly on the schedule.
+                        let now = std::time::Instant::now();
+                        if now + std::time::Duration::from_millis(8) < next_frame {
+                            continue;
+                        }
+                        next_frame = (next_frame + min).max(now);
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;

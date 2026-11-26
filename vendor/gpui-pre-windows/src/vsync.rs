@@ -8,7 +8,10 @@ use gpui::FrameRequestSource;
 use gpui_util::ResultExt;
 use windows::Win32::{
     Foundation::HWND,
-    Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
+    Graphics::{
+        Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
+        Dxgi::{DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1},
+    },
     System::Performance::QueryPerformanceFrequency,
 };
 
@@ -19,6 +22,23 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
     unsafe { QueryPerformanceFrequency(&mut frequency).unwrap() };
     frequency as u64
 });
+
+/// HERDR: frames per second on an adapter without a GPU.
+const SOFTWARE_FPS: u32 = 15;
+
+/// HERDR: the shortest time between frames on `adapter`, or `None` for every
+/// vsync. Without a GPU (WARP), every frame is rasterized on the CPU, and
+/// streaming output asks for one each vsync. `HERDR_APP_SOFTWARE_FPS` sets the
+/// rate (`0`: every vsync).
+pub(crate) fn min_frame_interval(adapter: &IDXGIAdapter1) -> Option<Duration> {
+    let software = unsafe { adapter.GetDesc1() }
+        .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+    let fps = std::env::var("HERDR_APP_SOFTWARE_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(SOFTWARE_FPS);
+    (software && fps > 0).then(|| Duration::from_secs(1) / fps)
+}
 
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
