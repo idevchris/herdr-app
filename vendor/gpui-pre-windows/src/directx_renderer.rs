@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -20,6 +21,8 @@ use windows::{
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+use crate::damage::Rect;
+use crate::partial_redraw::{self, PartialRedraw, Touched};
 use crate::*;
 use gpui::*;
 
@@ -54,6 +57,10 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// HERDR: redraws only what changed, on adapters without a GPU (see
+    /// `partial_redraw.rs`); `None` redraws the whole window every frame.
+    partial: Option<PartialRedraw>,
 }
 
 /// Direct3D objects
@@ -65,6 +72,8 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) device_context: ID3D11DeviceContext,
     dxgi_device: Option<IDXGIDevice>,
     annotation: Option<ID3DUserDefinedAnnotation>,
+    // HERDR: `ClearView` clears rectangles, for partial redraws.
+    context1: Option<ID3D11DeviceContext1>,
 }
 
 struct DirectXResources {
@@ -141,6 +150,7 @@ impl DirectXRendererDevices {
             Some(device.cast().context("Creating DXGI device")?)
         };
         let annotation = device_context.cast().ok();
+        let context1 = device_context.cast().ok();
 
         Ok(Self {
             adapter: adapter.clone(),
@@ -149,6 +159,7 @@ impl DirectXRendererDevices {
             device_context: device_context.clone(),
             dxgi_device,
             annotation,
+            context1,
         })
     }
 }
@@ -165,6 +176,7 @@ impl DirectXRenderer {
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Creating DirectX devices")?;
+        let partial = partial_redraw_for(&devices);
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
         let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
@@ -197,6 +209,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            partial,
         })
     }
 
@@ -204,13 +217,10 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(&self, clear_color: &[f32; 4], rects: Option<&[Rect]>) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
-        let device_context = &self
-            .devices
-            .as_ref()
-            .expect("devices missing")
-            .device_context;
+        let devices = self.devices.as_ref().expect("devices missing");
+        let device_context = &devices.device_context;
         update_buffer(
             device_context,
             self.globals.global_params_buffer.as_ref().unwrap(),
@@ -223,16 +233,18 @@ impl DirectXRenderer {
                 _pad: [0; 3],
             }],
         )?;
+        let target = self.target_view();
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
-            device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            let view = target.as_ref().context("missing render target view")?;
+            match (rects, &devices.context1) {
+                // HERDR: clear only what is redrawn; the rest keeps the last frame.
+                (Some(rects), Some(context1)) => {
+                    let rects: Vec<_> = rects.iter().map(partial_redraw::to_rect).collect();
+                    context1.ClearView(view, clear_color, Some(&rects));
+                }
+                _ => device_context.ClearRenderTargetView(view, clear_color),
+            }
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&target)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
@@ -244,16 +256,40 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// HERDR: with `rects`, tells DWM that only they changed.
     #[inline]
-    fn present(&mut self) -> Result<()> {
-        let result = unsafe {
-            self.resources
-                .as_ref()
-                .expect("resources missing")
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+    fn present(&mut self, rects: Option<&[Rect]>) -> Result<()> {
+        let swap_chain = &self.resources.as_ref().expect("resources missing").swap_chain;
+        let result = match rects {
+            Some(rects) => {
+                let mut rects: Vec<_> = rects.iter().map(partial_redraw::to_rect).collect();
+                let params = DXGI_PRESENT_PARAMETERS {
+                    DirtyRectsCount: rects.len() as u32,
+                    pDirtyRects: rects.as_mut_ptr(),
+                    pScrollRect: std::ptr::null_mut(),
+                    pScrollOffset: std::ptr::null_mut(),
+                };
+                unsafe { swap_chain.Present1(0, DXGI_PRESENT(0), &params) }
+            }
+            None => unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) },
         };
         result.ok().context("Presenting swap chain failed")
+    }
+
+    /// HERDR: what frames draw into: the canvas of a partial redraw, or the
+    /// back buffer.
+    fn target_view(&self) -> Option<ID3D11RenderTargetView> {
+        match self.partial.as_ref().and_then(PartialRedraw::canvas_view) {
+            Some(view) => Some(view.clone()),
+            None => self.resources.as_ref()?.render_target_view.clone(),
+        }
+    }
+
+    /// HERDR: the next frame draws everything.
+    fn forget_frames(&mut self) {
+        if let Some(partial) = &mut self.partial {
+            partial.forget();
+        }
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -291,6 +327,8 @@ impl DirectXRenderer {
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Recreating DirectX devices")?;
+        // HERDR: the adapter may have changed (to or from a GPU).
+        self.partial = partial_redraw_for(&devices);
         let resources = DirectXResources::new(
             &devices,
             self.width,
@@ -340,8 +378,50 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        if self.partial.is_none() {
+            self.render(scene, background_appearance, None)?;
+            return self.present(None);
+        }
+        let result = self.draw_partial(scene, background_appearance);
+        if result.is_err() {
+            self.forget_frames();
+        }
+        result
+    }
+
+    /// HERDR: draws what changed into the canvas, copies to the back buffer
+    /// what it lacks, and presents (see `partial_redraw.rs`).
+    fn draw_partial(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let partial = self.partial.as_mut().context("partial redraw missing")?;
+        let Some(pass) = partial.begin(
+            &devices.device,
+            scene,
+            background_appearance,
+            self.atlas.removals(),
+            self.width,
+            self.height,
+        )?
+        else {
+            return Ok(());
+        };
+        self.render(scene, background_appearance, pass.rects())?;
+        let (Some(devices), Some(resources), Some(partial)) =
+            (&self.devices, &self.resources, &mut self.partial)
+        else {
+            anyhow::bail!("renderer state missing");
+        };
+        let back_buffer = resources.render_target.as_ref().context("render target missing")?;
+        partial.copy_to(&devices.device_context, back_buffer, &pass)?;
+        self.present(pass.rects())?;
+        if let Some(partial) = &mut self.partial {
+            partial.presented(pass);
+        }
+        Ok(())
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -349,16 +429,45 @@ impl DirectXRenderer {
     /// [`draw`](Self::draw) (which then presents) and
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
+    ///
+    /// HERDR: with `rects`, draws only inside them, one scissor pass each.
     fn render(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
+        rects: Option<&[Rect]>,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+        self.pre_draw(
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+            rects,
+        )?;
         self.upload_scene_buffers(scene)?;
+        match rects {
+            None => self.draw_batches(scene, None),
+            Some(rects) => rects
+                .iter()
+                .try_for_each(|rect| self.draw_batches(scene, Some(rect))),
+        }
+    }
+
+    /// Draws every batch of `scene`; with `scissor`, only inside it and only
+    /// the primitives that meet it.
+    fn draw_batches(&mut self, scene: &Scene, scissor: Option<&Rect>) -> Result<()> {
+        let window = Rect::new(0, 0, self.width as i32, self.height as i32);
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let scissor_rect = partial_redraw::to_rect(scissor.unwrap_or(&window));
+        unsafe { devices.device_context.RSSetScissorRects(Some(&[scissor_rect])) };
+        let pick = |this: &Self, of: fn(&Touched) -> &[Rect], range: Range<usize>| {
+            match (scissor, this.partial.as_ref()) {
+                (Some(clip), Some(partial)) => {
+                    crate::damage::runs(of(&partial.touched), range, clip)
+                }
+                _ => vec![range],
+            }
+        };
 
         let annotation = self
             .devices
@@ -370,22 +479,40 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => self.draw_quads(&scene.quads[range.clone()], range.start),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
-                }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+                PrimitiveBatch::Shadows(range) => pick(self, |t| &t.shadows, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_shadows(r.start, r.len())),
+                PrimitiveBatch::Quads(range) => pick(self, |t| &t.quads, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_quads(&scene.quads[r.clone()], r.start)),
+                PrimitiveBatch::Paths(range) => pick(self, |t| &t.paths, range)
+                    .into_iter()
+                    .try_for_each(|r| {
+                        let paths = &scene.paths[r];
+                        self.draw_paths_to_intermediate(paths)?;
+                        self.draw_paths_from_intermediate(paths)
+                    }),
+                PrimitiveBatch::Underlines(range) => pick(self, |t| &t.underlines, range)
+                    .into_iter()
+                    .try_for_each(|r| self.draw_underlines(r.start, r.len())),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
+                    pick(self, |t| &t.monochrome_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| {
+                            self.draw_monochrome_sprites(texture_id, r.start, r.len())
+                        })
                 }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
+                    pick(self, |t| &t.subpixel_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| self.draw_subpixel_sprites(texture_id, r.start, r.len()))
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                    pick(self, |t| &t.polychrome_sprites, range)
+                        .into_iter()
+                        .try_for_each(|r| {
+                            self.draw_polychrome_sprites(texture_id, r.start, r.len())
+                        })
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
@@ -425,7 +552,9 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
-        self.render(scene, background_appearance)?;
+        // HERDR: draw into the back buffer; the next frame then draws all.
+        self.forget_frames();
+        self.render(scene, background_appearance, None)?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
@@ -493,6 +622,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.forget_frames();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -672,7 +802,7 @@ impl DirectXRenderer {
             // Restore main render target
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(&self.target_view())), None);
         }
 
         Ok(())
@@ -1509,7 +1639,9 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        // HERDR: `draw_batches` sets the scissor (the window, or one
+        // rectangle of a partial redraw).
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -1788,6 +1920,13 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
 }
 
 const BUFFER_COUNT: usize = 3;
+
+/// HERDR: partial redraws for `devices`, if wanted and possible.
+fn partial_redraw_for(devices: &DirectXRendererDevices) -> Option<PartialRedraw> {
+    let on = devices.context1.is_some() && partial_redraw::wanted(&devices.adapter);
+    log::info!("partial redraw: {on}");
+    on.then(|| PartialRedraw::new(BUFFER_COUNT))
+}
 
 pub(crate) mod shader_resources {
     use anyhow::Result;

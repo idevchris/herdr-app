@@ -21,6 +21,9 @@ struct DirectXAtlasTextures {
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
+    // HERDR: counts freed tiles. A freed tile's place (and id) can go to new
+    // pixels, so the renderer redraws everything when this changes.
+    removals: u64,
 }
 
 struct DirectXAtlasTexture {
@@ -40,7 +43,13 @@ impl DirectXAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
+            removals: 0,
         })))
+    }
+
+    /// HERDR: how many tiles were freed so far (see `removals`).
+    pub(crate) fn removals(&self) -> u64 {
+        self.0.lock().backend.removals
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -110,6 +119,7 @@ impl AtlasBackend for DirectXAtlasTextures {
     }
 
     fn remove(&mut self, tile: AtlasTile) {
+        self.removals += 1;
         let id = tile.texture_id;
 
         let textures = match id.kind {

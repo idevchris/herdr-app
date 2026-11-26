@@ -1,6 +1,8 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+mod damage;
+mod partial_redraw;
 mod destination_list;
 mod dialog;
 mod direct_manipulation;
